@@ -1,20 +1,29 @@
-# db.py (Postgres no Render)
 import os
-import psycopg2
+import psycopg
 
 def conectar():
+    """
+    Usa DATABASE_URL (postgres://... sslmode=require).
+    Se não existir, tenta variáveis separadas: PGHOST/PGDATABASE/PGUSER/PGPASSWORD/PGPORT.
+    Força SSL por padrão (recomendado em Render/Neon).
+    """
     url = os.getenv("DATABASE_URL")
-    if not url:
-        # opcionalmente, você pode dar raise aqui:
-        # raise RuntimeError("DATABASE_URL não definida")
-        # mas deixo um fallback com variáveis separadas:
-        host = os.getenv("PGHOST", "localhost")
-        db   = os.getenv("PGDATABASE", "postgres")
-        user = os.getenv("PGUSER", "postgres")
-        pwd  = os.getenv("PGPASSWORD", "")
-        port = int(os.getenv("PGPORT", "5432"))
-        return psycopg2.connect(
-            host=host, dbname=db, user=user, password=pwd, port=port, sslmode="require"
-        )
-    # Render/Neon costumam exigir SSL
-    return psycopg2.connect(url, sslmode="require")
+    if url:
+        # psycopg3 aceita string de conexão; sslmode=require já vem na URL do Render
+        return psycopg.connect(url)
+
+    host = os.getenv("PGHOST", "localhost")
+    db   = os.getenv("PGDATABASE", "postgres")
+    user = os.getenv("PGUSER", "postgres")
+    pwd  = os.getenv("PGPASSWORD", "")
+    port = int(os.getenv("PGPORT", "5432"))
+
+    return psycopg.connect(
+        host=host,
+        dbname=db,
+        user=user,
+        password=pwd,
+        port=port,
+        sslmode="require",
+    )
+

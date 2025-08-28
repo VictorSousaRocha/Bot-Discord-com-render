@@ -1,8 +1,4 @@
-# discord
 discord.py==2.3.2
-# env
 python-dotenv==1.0.1
-# postgres
-psycopg2-binary==2.9.9
-# backport do audioop para Python 3.13+
+psycopg[binary]==3.2.1
 audioop-lts
