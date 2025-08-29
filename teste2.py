@@ -54,20 +54,22 @@ async def before_keep_alive():
 # ========== Utils ==========
 def registrar_servidor(guild: discord.Guild):
     conn = conectar()
-    cursor = conn.cursor()
-    # Garante que cria se não existir e "reativa" se já existir
-    cursor.execute(
-        """
-        INSERT INTO servidores (id, nome, ativo)
-        VALUES (%s, %s, 1)
-        ON CONFLICT (id)
-        DO UPDATE SET nome = EXCLUDED.nome, ativo = TRUE
-        """,
-        (guild.id, guild.name),
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO servidores (id, nome, ativo)
+            VALUES (%s, %s, TRUE)
+            ON CONFLICT (id)
+            DO UPDATE SET nome = EXCLUDED.nome, ativo = TRUE
+            """,
+            (guild.id, guild.name),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
 
 
 def ensure_schema():
@@ -201,8 +203,8 @@ def servidor_ativo(guild_id: int) -> bool:
     res = cursor.fetchone()
     cursor.close()
     conn.close()
-    # Se 'ativo' for BOOL no Postgres, aceita True; se for inteiro (1/0), aceita 1.
     return bool(res and (res[0] is True or res[0] == 1))
+
 
 def parse_funcoes_limites(texto: str):
     resultado = {}
@@ -216,18 +218,21 @@ def parse_funcoes_limites(texto: str):
 def registrar_servidor(guild: discord.Guild):
     conn = conectar()
     cursor = conn.cursor()
-    # Postgres: ON CONFLICT (id) DO NOTHING requer UNIQUE/PK em servidores.id
-    cursor.execute(
-        """
-        INSERT INTO servidores (id, nome, ativo)
-        VALUES (%s, %s, 1)
-        ON CONFLICT (id) DO NOTHING
-        """,
-        (guild.id, guild.name),
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO servidores (id, nome, ativo)
+            VALUES (%s, %s, TRUE)
+            ON CONFLICT (id)
+            DO UPDATE SET nome = EXCLUDED.nome, ativo = TRUE
+            """,
+            (guild.id, guild.name),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
 
 def inserir_funcao(servidor_id: int, nome: str, emoji: str):
     conn = conectar()
@@ -310,27 +315,24 @@ def buscar_cargo_funcao(servidor_id: int):
 
 # ========== Banco (NOVO) – Presets ==========
 def upsert_preset(servidor_id: int, nome: str, criado_por: int) -> int:
-    """
-    UPSERT real em Postgres, assumindo UNIQUE (servidor_id, nome) em presets.
-    Ativa (ativo=1) se já existir; cria se não existir.
-    """
     conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
         INSERT INTO presets (servidor_id, nome, criado_por, ativo)
-        VALUES (%s, %s, %s, 1)
+        VALUES (%s, %s, %s, TRUE)
         ON CONFLICT (servidor_id, nome)
         DO UPDATE SET ativo = TRUE
         RETURNING id
         """,
         (servidor_id, nome, criado_por),
     )
-    preset_id = cursor.fetchone()[0]
+    preset_id = cur.fetchone()[0]
     conn.commit()
-    cursor.close()
+    cur.close()
     conn.close()
     return preset_id
+
 
 def set_preset_funcoes(preset_id: int, mapa: dict):
     conn = conectar()
@@ -348,7 +350,7 @@ def set_preset_funcoes(preset_id: int, mapa: dict):
 def get_preset_funcoes(servidor_id: int, nome: str):
     conn = conectar()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM presets WHERE servidor_id = %s AND nome = %s AND ativo = 1", (servidor_id, nome))
+    cursor.execute("SELECT id FROM presets WHERE servidor_id = %s AND nome = %s AND ativo = TRUE", (servidor_id, nome))
     row = cursor.fetchone()
     if not row:
         cursor.close()
