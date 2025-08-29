@@ -1,6 +1,5 @@
 discord.py==2.3.2
 python-dotenv==1.0.1
-psycopg[binary]==3.2.1
-audioop-lts
+psycopg[binary]==3.2.9
+audioop-lts==0.2.2
 aiohttp==3.10.5
-
