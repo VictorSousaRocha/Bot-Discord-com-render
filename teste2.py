@@ -61,7 +61,7 @@ def registrar_servidor(guild: discord.Guild):
         INSERT INTO servidores (id, nome, ativo)
         VALUES (%s, %s, 1)
         ON CONFLICT (id)
-        DO UPDATE SET nome = EXCLUDED.nome, ativo = 1
+        DO UPDATE SET nome = EXCLUDED.nome, ativo = TRUE
         """,
         (guild.id, guild.name),
     )
@@ -321,7 +321,7 @@ def upsert_preset(servidor_id: int, nome: str, criado_por: int) -> int:
         INSERT INTO presets (servidor_id, nome, criado_por, ativo)
         VALUES (%s, %s, %s, 1)
         ON CONFLICT (servidor_id, nome)
-        DO UPDATE SET ativo = 1
+        DO UPDATE SET ativo = TRUE
         RETURNING id
         """,
         (servidor_id, nome, criado_por),
