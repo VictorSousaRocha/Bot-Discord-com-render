@@ -70,6 +70,129 @@ def registrar_servidor(guild: discord.Guild):
     conn.close()
 
 
+def ensure_schema():
+    """Cria todas as tabelas/índices necessários (idempotente)."""
+    DDLs = [
+        # 1) Servidores
+        """
+        CREATE TABLE IF NOT EXISTS servidores (
+          id        BIGINT PRIMARY KEY,
+          nome      TEXT NOT NULL,
+          ativo     BOOLEAN NOT NULL DEFAULT TRUE
+        );
+        """,
+
+        # 2) Funções
+        """
+        CREATE TABLE IF NOT EXISTS funcoes (
+          id           BIGSERIAL PRIMARY KEY,
+          servidor_id  BIGINT NOT NULL,
+          nome         TEXT NOT NULL,
+          emoji        TEXT NOT NULL,
+          FOREIGN KEY (servidor_id) REFERENCES servidores(id) ON DELETE CASCADE
+        );
+        """,
+        # (opcional) evitar duplicatas de nome+emoji por servidor
+        "CREATE UNIQUE INDEX IF NOT EXISTS funcoes_servidor_nome_emoji_uidx ON funcoes(servidor_id, LOWER(nome), emoji);",
+
+        # 3) Funções ↔ Cargos (UPSERT por (servidor_id, nome_funcao))
+        """
+        CREATE TABLE IF NOT EXISTS funcoes_cargos (
+          servidor_id BIGINT NOT NULL,
+          nome_funcao TEXT   NOT NULL,
+          nome_cargo  TEXT   NOT NULL,
+          PRIMARY KEY (servidor_id, nome_funcao),
+          FOREIGN KEY (servidor_id) REFERENCES servidores(id) ON DELETE CASCADE
+        );
+        """,
+
+        # 4) Guerras
+        """
+        CREATE TABLE IF NOT EXISTS guerras (
+          id          BIGSERIAL PRIMARY KEY,
+          servidor_id BIGINT NOT NULL,
+          data        TEXT   NOT NULL,
+          mensagem_id BIGINT NOT NULL,
+          canal_id    BIGINT NOT NULL,
+          criado_em   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          FOREIGN KEY (servidor_id) REFERENCES servidores(id) ON DELETE CASCADE
+        );
+        """,
+
+        # 5) Participantes
+        """
+        CREATE TABLE IF NOT EXISTS participantes (
+          id        BIGSERIAL PRIMARY KEY,
+          guerra_id BIGINT NOT NULL,
+          user_id   BIGINT NOT NULL,
+          username  TEXT   NOT NULL,
+          emoji     TEXT   NOT NULL,
+          status    TEXT   NOT NULL,
+          FOREIGN KEY (guerra_id) REFERENCES guerras(id) ON DELETE CASCADE
+        );
+        """,
+        # ajuda a não repetir o mesmo user duas vezes na mesma guerra
+        "CREATE UNIQUE INDEX IF NOT EXISTS participantes_guerra_user_uidx ON participantes(guerra_id, user_id);",
+
+        # 6) Presets
+        """
+        CREATE TABLE IF NOT EXISTS presets (
+          id          BIGSERIAL PRIMARY KEY,
+          servidor_id BIGINT NOT NULL,
+          nome        TEXT   NOT NULL,
+          criado_por  BIGINT NOT NULL,
+          criado_em   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          ativo       BOOLEAN NOT NULL DEFAULT TRUE,
+          UNIQUE (servidor_id, nome),
+          FOREIGN KEY (servidor_id) REFERENCES servidores(id) ON DELETE CASCADE
+        );
+        """,
+
+        # 7) Preset → Funções
+        """
+        CREATE TABLE IF NOT EXISTS preset_funcoes (
+          id          BIGSERIAL PRIMARY KEY,
+          preset_id   BIGINT NOT NULL,
+          funcao_nome TEXT   NOT NULL,
+          limite      INTEGER NOT NULL,
+          FOREIGN KEY (preset_id) REFERENCES presets(id) ON DELETE CASCADE
+        );
+        """,
+        # opcional: não repetir mesma função no mesmo preset
+        "CREATE UNIQUE INDEX IF NOT EXISTS preset_funcoes_preset_funcao_uidx ON preset_funcoes(preset_id, LOWER(funcao_nome));",
+    ]
+
+    conn = conectar()
+    cur = conn.cursor()
+    try:
+        for ddl in DDLs:
+            cur.execute(ddl)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def registrar_servidor(guild: discord.Guild):
+    """Cria/ativa o servidor (idempotente)."""
+    conn = conectar()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO servidores (id, nome, ativo)
+            VALUES (%s, %s, TRUE)
+            ON CONFLICT (id)
+            DO UPDATE SET nome = EXCLUDED.nome, ativo = TRUE
+            """,
+            (guild.id, guild.name),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
 
 def servidor_ativo(guild_id: int) -> bool:
     conn = conectar()
@@ -325,8 +448,16 @@ async def _refresh_embed(client: commands.Bot, guild: discord.Guild):
 @bot.command(name="ativar")
 @commands.has_permissions(administrator=True)
 async def ativar_servidor_cmd(ctx):
-    registrar_servidor(ctx.guild)
-    await ctx.send("✅ Servidor cadastrado/ativado com sucesso!")
+    """Cria o schema e ativa/cadastra este servidor."""
+    try:
+        ensure_schema()            # cria tabelas/índices que faltarem
+        registrar_servidor(ctx.guild)  # cadastra/ativa este guild
+        await ctx.send("✅ Servidor cadastrado/ativado e schema verificado!")
+    except Exception as e:
+        await ctx.send("❌ Falha ao ativar. Veja os logs.")
+        # log detalhado no console
+        import traceback
+        traceback.print_exception(type(e), e, e.__traceback__)
 
 @bot.command()
 async def cargo(ctx, nome_funcao: str, *, nome_cargo: str):
