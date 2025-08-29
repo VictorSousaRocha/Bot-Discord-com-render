@@ -52,6 +52,25 @@ async def before_keep_alive():
     print("⏳ Aguardando bot iniciar para começar o keep-alive...")
 
 # ========== Utils ==========
+def registrar_servidor(guild: discord.Guild):
+    conn = conectar()
+    cursor = conn.cursor()
+    # Garante que cria se não existir e "reativa" se já existir
+    cursor.execute(
+        """
+        INSERT INTO servidores (id, nome, ativo)
+        VALUES (%s, %s, 1)
+        ON CONFLICT (id)
+        DO UPDATE SET nome = EXCLUDED.nome, ativo = 1
+        """,
+        (guild.id, guild.name),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+
 def servidor_ativo(guild_id: int) -> bool:
     conn = conectar()
     cursor = conn.cursor()
@@ -303,6 +322,12 @@ async def _refresh_embed(client: commands.Bot, guild: discord.Guild):
     await msg.edit(embed=gerar_texto_evento_embed(), view=GuerraView(guild))
 
 # ========== Comandos ==========
+@bot.command(name="ativar")
+@commands.has_permissions(administrator=True)
+async def ativar_servidor_cmd(ctx):
+    registrar_servidor(ctx.guild)
+    await ctx.send("✅ Servidor cadastrado/ativado com sucesso!")
+
 @bot.command()
 async def cargo(ctx, nome_funcao: str, *, nome_cargo: str):
     if not servidor_ativo(ctx.guild.id):
