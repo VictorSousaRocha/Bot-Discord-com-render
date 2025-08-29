@@ -1,28 +1,31 @@
-# teste2.py (antes estava como "bot.py" no cabeçalho do seu texto)
+# teste2.py
 import os
-import discord
-from discord.ext import commands
 import asyncio
-from db import conectar
+import discord
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
+from db import conectar
 
-# --- ADIÇÃO: servidor HTTP p/ healthcheck do Render ---
+# --- HTTP (keepalive p/ Render Web Service) ---
 try:
     from aiohttp import web
 except ImportError:
-    web = None  # em produção, inclua aiohttp no requirements.txt
+    web = None
 
 load_dotenv()
 
+# ===== Intents / Bot =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# (mantido por compatibilidade; agora o canal é salvo por servidor)
 ID_CANAL_AUTORIZADO = 1398460521681915965
 
-# Memória do evento atual
+# ===== Variáveis globais de evento =====
 # emoji -> {nome, usuarios[], limite, fila[], sem_permissao[]}
 listas_reacoes = {}
 mensagem_evento_id = None
@@ -30,137 +33,156 @@ mensagem_evento_obj = None
 dia_evento = ""
 guerra_id = None
 
-# =========== manter o banco ativo ==========
-from discord.ext import tasks
+# ===== Singleton (evita instâncias duplicadas respondendo no Discord) =====
+RENDER_INSTANCE_ID = os.getenv("RENDER_INSTANCE_ID", "local")
+_SINGLETON_LOCK_KEY = 987654321012345678  # qualquer inteiro fixo 64-bit
+_SINGLETON_CONN = None  # manter conexão viva para manter o lock
 
+def _try_acquire_singleton_lock() -> bool:
+    """Pega pg_try_advisory_lock; se não conseguir, outra instância já está ativa."""
+    global _SINGLETON_CONN
+    try:
+        _SINGLETON_CONN = conectar()
+        cur = _SINGLETON_CONN.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s);", (_SINGLETON_LOCK_KEY,))
+        ok = cur.fetchone()[0]
+        return bool(ok)
+    except Exception as e:
+        print(f"[singleton] erro ao tentar lock: {e}")
+        try:
+            if _SINGLETON_CONN:
+                _SINGLETON_CONN.close()
+        except Exception:
+            pass
+        _SINGLETON_CONN = None
+        return False
+
+# ===== Keep-alive do banco =====
 @tasks.loop(minutes=7)
 async def keep_alive_db():
     try:
         conn = conectar()
         cursor = conn.cursor()
-        cursor.execute("SELECT 1;")  # ping simples
+        cursor.execute("SELECT 1;")
         conn.commit()
         cursor.close()
         conn.close()
-        print("✅ Keep-alive executado com sucesso!")
+        print("✅ Keep-alive DB ok")
     except Exception as e:
-        print(f"⚠️ Erro no keep-alive: {e}")
+        print(f"⚠️ Erro no keep-alive DB: {e}")
 
 @keep_alive_db.before_loop
 async def before_keep_alive():
     await bot.wait_until_ready()
-    print("⏳ Aguardando bot iniciar para começar o keep-alive...")
+    print("⏳ Aguardando bot iniciar para keep-alive...")
 
-# ========== Utils ==========
-def registrar_servidor(guild: discord.Guild):
+# ===== Utils =====
+def servidor_ativo(guild_id: int) -> bool:
     conn = conectar()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            INSERT INTO servidores (id, nome, ativo)
-            VALUES (%s, %s, TRUE)
-            ON CONFLICT (id)
-            DO UPDATE SET nome = EXCLUDED.nome, ativo = TRUE
-            """,
-            (guild.id, guild.name),
-        )
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
+    cursor = conn.cursor()
+    cursor.execute("SELECT ativo FROM servidores WHERE id = %s", (guild_id,))
+    res = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return bool(res and (res[0] is True or res[0] == 1))
 
+def parse_funcoes_limites(texto: str):
+    resultado = {}
+    itens = [p.strip() for p in texto.split(",") if p.strip()]
+    for item in itens:
+        nome, limite = item.rsplit(" ", 1)
+        resultado[nome.strip().lower()] = int(limite.strip())
+    return resultado
 
-
+# ===== Schema / Banco =====
 def ensure_schema():
     """Cria todas as tabelas/índices necessários (idempotente)."""
     DDLs = [
-        # 1) Servidores
+        # servidores
         """
         CREATE TABLE IF NOT EXISTS servidores (
-          id        BIGINT PRIMARY KEY,
-          nome      TEXT NOT NULL,
-          ativo     BOOLEAN NOT NULL DEFAULT TRUE
+          id BIGINT PRIMARY KEY,
+          nome TEXT NOT NULL,
+          ativo BOOLEAN NOT NULL DEFAULT TRUE,
+          canal_autorizado BIGINT
         );
         """,
+        "ALTER TABLE servidores ADD COLUMN IF NOT EXISTS canal_autorizado BIGINT;",
 
-        # 2) Funções
+        # funcoes
         """
         CREATE TABLE IF NOT EXISTS funcoes (
-          id           BIGSERIAL PRIMARY KEY,
-          servidor_id  BIGINT NOT NULL,
-          nome         TEXT NOT NULL,
-          emoji        TEXT NOT NULL,
+          id BIGSERIAL PRIMARY KEY,
+          servidor_id BIGINT NOT NULL,
+          nome TEXT NOT NULL,
+          emoji TEXT NOT NULL,
           FOREIGN KEY (servidor_id) REFERENCES servidores(id) ON DELETE CASCADE
         );
         """,
-        # (opcional) evitar duplicatas de nome+emoji por servidor
         "CREATE UNIQUE INDEX IF NOT EXISTS funcoes_servidor_nome_emoji_uidx ON funcoes(servidor_id, LOWER(nome), emoji);",
 
-        # 3) Funções ↔ Cargos (UPSERT por (servidor_id, nome_funcao))
+        # funcoes_cargos
         """
         CREATE TABLE IF NOT EXISTS funcoes_cargos (
           servidor_id BIGINT NOT NULL,
-          nome_funcao TEXT   NOT NULL,
-          nome_cargo  TEXT   NOT NULL,
+          nome_funcao TEXT NOT NULL,
+          nome_cargo  TEXT NOT NULL,
           PRIMARY KEY (servidor_id, nome_funcao),
           FOREIGN KEY (servidor_id) REFERENCES servidores(id) ON DELETE CASCADE
         );
         """,
 
-        # 4) Guerras
+        # guerras
         """
         CREATE TABLE IF NOT EXISTS guerras (
-          id          BIGSERIAL PRIMARY KEY,
+          id BIGSERIAL PRIMARY KEY,
           servidor_id BIGINT NOT NULL,
-          data        TEXT   NOT NULL,
+          data TEXT NOT NULL,
           mensagem_id BIGINT NOT NULL,
-          canal_id    BIGINT NOT NULL,
-          criado_em   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          canal_id BIGINT NOT NULL,
+          criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           FOREIGN KEY (servidor_id) REFERENCES servidores(id) ON DELETE CASCADE
         );
         """,
 
-        # 5) Participantes
+        # participantes
         """
         CREATE TABLE IF NOT EXISTS participantes (
-          id        BIGSERIAL PRIMARY KEY,
+          id BIGSERIAL PRIMARY KEY,
           guerra_id BIGINT NOT NULL,
-          user_id   BIGINT NOT NULL,
-          username  TEXT   NOT NULL,
-          emoji     TEXT   NOT NULL,
-          status    TEXT   NOT NULL,
+          user_id BIGINT NOT NULL,
+          username TEXT NOT NULL,
+          emoji TEXT NOT NULL,
+          status TEXT NOT NULL,
           FOREIGN KEY (guerra_id) REFERENCES guerras(id) ON DELETE CASCADE
         );
         """,
-        # ajuda a não repetir o mesmo user duas vezes na mesma guerra
         "CREATE UNIQUE INDEX IF NOT EXISTS participantes_guerra_user_uidx ON participantes(guerra_id, user_id);",
 
-        # 6) Presets
+        # presets
         """
         CREATE TABLE IF NOT EXISTS presets (
-          id          BIGSERIAL PRIMARY KEY,
+          id BIGSERIAL PRIMARY KEY,
           servidor_id BIGINT NOT NULL,
-          nome        TEXT   NOT NULL,
-          criado_por  BIGINT NOT NULL,
-          criado_em   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          ativo       BOOLEAN NOT NULL DEFAULT TRUE,
+          nome TEXT NOT NULL,
+          criado_por BIGINT NOT NULL,
+          criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          ativo BOOLEAN NOT NULL DEFAULT TRUE,
           UNIQUE (servidor_id, nome),
           FOREIGN KEY (servidor_id) REFERENCES servidores(id) ON DELETE CASCADE
         );
         """,
 
-        # 7) Preset → Funções
+        # preset_funcoes
         """
         CREATE TABLE IF NOT EXISTS preset_funcoes (
-          id          BIGSERIAL PRIMARY KEY,
-          preset_id   BIGINT NOT NULL,
-          funcao_nome TEXT   NOT NULL,
-          limite      INTEGER NOT NULL,
+          id BIGSERIAL PRIMARY KEY,
+          preset_id BIGINT NOT NULL,
+          funcao_nome TEXT NOT NULL,
+          limite INTEGER NOT NULL,
           FOREIGN KEY (preset_id) REFERENCES presets(id) ON DELETE CASCADE
         );
         """,
-        # opcional: não repetir mesma função no mesmo preset
         "CREATE UNIQUE INDEX IF NOT EXISTS preset_funcoes_preset_funcao_uidx ON preset_funcoes(preset_id, LOWER(funcao_nome));",
     ]
 
@@ -173,7 +195,6 @@ def ensure_schema():
     finally:
         cur.close()
         conn.close()
-
 
 def registrar_servidor(guild: discord.Guild):
     """Cria/ativa o servidor (idempotente)."""
@@ -194,45 +215,39 @@ def registrar_servidor(guild: discord.Guild):
         cur.close()
         conn.close()
 
-
-
-def servidor_ativo(guild_id: int) -> bool:
+def set_canal_autorizado(servidor_id: int, canal_id: int):
     conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute("SELECT ativo FROM servidores WHERE id = %s", (guild_id,))
-    res = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return bool(res and (res[0] is True or res[0] == 1))
-
-
-def parse_funcoes_limites(texto: str):
-    resultado = {}
-    itens = [p.strip() for p in texto.split(",") if p.strip()]
-    for item in itens:
-        nome, limite = item.rsplit(" ", 1)
-        resultado[nome.strip().lower()] = int(limite.strip())
-    return resultado
-
-# ========== Banco (existentes) ==========
-def registrar_servidor(guild: discord.Guild):
-    conn = conectar()
-    cursor = conn.cursor()
+    cur = conn.cursor()
     try:
-        cursor.execute(
-            """
-            INSERT INTO servidores (id, nome, ativo)
-            VALUES (%s, %s, TRUE)
-            ON CONFLICT (id)
-            DO UPDATE SET nome = EXCLUDED.nome, ativo = TRUE
-            """,
-            (guild.id, guild.name),
+        cur.execute(
+            "UPDATE servidores SET canal_autorizado = %s WHERE id = %s",
+            (canal_id, servidor_id),
         )
+        if cur.rowcount == 0:
+            cur.execute(
+                """
+                INSERT INTO servidores (id, nome, ativo, canal_autorizado)
+                VALUES (%s, %s, TRUE, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET canal_autorizado = EXCLUDED.canal_autorizado, ativo = TRUE
+                """,
+                (servidor_id, f"guild:{servidor_id}", canal_id),
+            )
         conn.commit()
     finally:
-        cursor.close()
+        cur.close()
         conn.close()
 
+def get_canal_autorizado(servidor_id: int):
+    conn = conectar()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT canal_autorizado FROM servidores WHERE id = %s", (servidor_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        cur.close()
+        conn.close()
 
 def inserir_funcao(servidor_id: int, nome: str, emoji: str):
     conn = conectar()
@@ -260,7 +275,6 @@ def buscar_funcoes_do_servidor(servidor_id: int):
 def criar_guerra(servidor_id: int, data: str, mensagem_id: int, canal_id: int) -> int:
     conn = conectar()
     cursor = conn.cursor()
-    # Postgres: use RETURNING para obter id
     cursor.execute(
         """
         INSERT INTO guerras (servidor_id, data, mensagem_id, canal_id)
@@ -290,7 +304,6 @@ def atualizar_participacao(guerra_id: int, user_id: int, username: str, emoji: s
 def salvar_cargo_funcao(servidor_id: int, nome_funcao: str, nome_cargo: str):
     conn = conectar()
     cursor = conn.cursor()
-    # Postgres não tem REPLACE. Use UPSERT:
     cursor.execute(
         """
         INSERT INTO funcoes_cargos (servidor_id, nome_funcao, nome_cargo)
@@ -313,7 +326,6 @@ def buscar_cargo_funcao(servidor_id: int):
     conn.close()
     return {nome_funcao.lower(): nome_cargo for nome_funcao, nome_cargo in dados}
 
-# ========== Banco (NOVO) – Presets ==========
 def upsert_preset(servidor_id: int, nome: str, criado_por: int) -> int:
     conn = conectar()
     cur = conn.cursor()
@@ -333,7 +345,6 @@ def upsert_preset(servidor_id: int, nome: str, criado_por: int) -> int:
     conn.close()
     return preset_id
 
-
 def set_preset_funcoes(preset_id: int, mapa: dict):
     conn = conectar()
     cursor = conn.cursor()
@@ -350,7 +361,16 @@ def set_preset_funcoes(preset_id: int, mapa: dict):
 def get_preset_funcoes(servidor_id: int, nome: str):
     conn = conectar()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM presets WHERE servidor_id = %s AND nome = %s AND ativo = TRUE", (servidor_id, nome))
+    cursor.execute(
+        """
+        SELECT id
+        FROM presets
+        WHERE servidor_id = %s
+          AND nome = %s
+          AND ativo IS TRUE
+        """,
+        (servidor_id, nome),
+    )
     row = cursor.fetchone()
     if not row:
         cursor.close()
@@ -385,7 +405,7 @@ def deletar_preset_db(servidor_id: int, nome: str) -> bool:
     conn.close()
     return apagou
 
-# ========== VIEW com botões ==========
+# ===== VIEW com botões =====
 class GuerraView(discord.ui.View):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=None)
@@ -398,7 +418,9 @@ class GuerraButton(discord.ui.Button):
         super().__init__(style=discord.ButtonStyle.secondary, label=label, emoji=emoji, custom_id=custom_id)
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.channel_id != ID_CANAL_AUTORIZADO:
+        # Checagem por servidor
+        canal_aut = get_canal_autorizado(interaction.guild_id)
+        if canal_aut and interaction.channel_id != canal_aut:
             return await interaction.response.send_message("⛔ Este comando só funciona no canal autorizado.", ephemeral=True)
         if not servidor_ativo(interaction.guild_id):
             return await interaction.response.send_message("❌ Este servidor está inativo.", ephemeral=True)
@@ -407,6 +429,8 @@ class GuerraButton(discord.ui.Button):
         member = interaction.user
         emoji = str(self.emoji)
 
+        for info in listas_reacoes.items():
+            pass  # placeholder para evitar erro se loop abaixo mudar - garantindo compat.
         for info in listas_reacoes.values():
             info["usuarios"] = [u for u in info["usuarios"] if u != member.display_name]
             info["fila"] = [u for u in info["fila"] if u != member.display_name]
@@ -442,25 +466,14 @@ class GuerraButton(discord.ui.Button):
         await interaction.followup.send(msg, ephemeral=True)
 
 async def _refresh_embed(client: commands.Bot, guild: discord.Guild):
-    canal = client.get_channel(ID_CANAL_AUTORIZADO)
+    ca = get_canal_autorizado(guild.id)
+    canal = client.get_channel(ca) if ca else (client.get_channel(mensagem_evento_obj.channel.id) if mensagem_evento_obj else None)
+    if canal is None:
+        return
     msg = await canal.fetch_message(mensagem_evento_id)
     await msg.edit(embed=gerar_texto_evento_embed(), view=GuerraView(guild))
 
-# ========== Comandos ==========
-@bot.command(name="ativar")
-@commands.has_permissions(administrator=True)
-async def ativar_servidor_cmd(ctx):
-    """Cria o schema e ativa/cadastra este servidor."""
-    try:
-        ensure_schema()            # cria tabelas/índices que faltarem
-        registrar_servidor(ctx.guild)  # cadastra/ativa este guild
-        await ctx.send("✅ Servidor cadastrado/ativado e schema verificado!")
-    except Exception as e:
-        await ctx.send("❌ Falha ao ativar. Veja os logs.")
-        # log detalhado no console
-        import traceback
-        traceback.print_exception(type(e), e, e.__traceback__)
-
+# ===== Comandos =====
 @bot.command()
 async def cargo(ctx, nome_funcao: str, *, nome_cargo: str):
     if not servidor_ativo(ctx.guild.id):
@@ -468,9 +481,12 @@ async def cargo(ctx, nome_funcao: str, *, nome_cargo: str):
     salvar_cargo_funcao(ctx.guild.id, nome_funcao.lower(), nome_cargo)
     await ctx.send(f"✅ Função **{nome_funcao}** agora exige o cargo **{nome_cargo}** para participar.")
 
-@bot.command()
+@bot.command(aliases=["newRole"])
 async def novaRole(ctx, nome: str, emoji: str):
-    if ctx.channel.id != ID_CANAL_AUTORIZADO:
+    # checagem por servidor
+    ca = get_canal_autorizado(ctx.guild.id)
+    if ca and ctx.channel.id != ca:
+        await ctx.send("⛔ Este comando só pode ser usado no canal autorizado. Use `!setcanal` no canal desejado.")
         return
     if not servidor_ativo(ctx.guild.id):
         return await ctx.send("❌ Este servidor está inativo. Contate o administrador.")
@@ -486,9 +502,6 @@ async def relatorio(ctx):
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM guerras WHERE servidor_id = %s", (ctx.guild.id,))
     total_guerras = cursor.fetchone()[0]
-    # Ajustes para Postgres:
-    # - COUNT(*) FILTER (WHERE ...)
-    # - string_agg(DISTINCT ..., ',')
     cursor.execute(
         """
         SELECT
@@ -580,7 +593,9 @@ async def preset_deletar(ctx, nome: str):
 async def evento(ctx, preset: str = None, *, data_opcional: str = None):
     global mensagem_evento_id, mensagem_evento_obj, dia_evento, listas_reacoes, guerra_id
 
-    if ctx.channel.id != ID_CANAL_AUTORIZADO:
+    ca = get_canal_autorizado(ctx.guild.id)
+    if ca and ctx.channel.id != ca:
+        await ctx.send("⛔ Este comando só pode ser usado no canal autorizado. Use `!setcanal` no canal desejado.")
         return
     if not servidor_ativo(ctx.guild.id):
         return await ctx.send("❌ Este servidor está inativo. Contate o administrador.")
@@ -646,17 +661,19 @@ async def evento(ctx, preset: str = None, *, data_opcional: str = None):
 @bot.command(name="ajuda")
 async def ajuda(ctx):
     embed = discord.Embed(title="📘 Comandos disponíveis", color=discord.Color.green())
-    embed.add_field(name="!novaRole <nome> <emoji>", value="Adiciona uma nova função com emoji.", inline=False)
+    embed.add_field(name="!novaRole <nome> <emoji>", value="Adiciona uma nova função com emoji. (alias: !newRole)", inline=False)
     embed.add_field(name="!removeRole <nome>", value="Remove uma função existente.", inline=False)
     embed.add_field(name="!funções", value="Lista funções registradas.", inline=False)
     embed.add_field(name="!cargo <função> <cargo>", value="Define o cargo necessário para a função.", inline=False)
-    embed.add_field(name="!cargos", value="Lista todas as funções e seus respectivos cargos necesarios!.", inline=False)
+    embed.add_field(name="!cargos", value="Lista todas as funções e cargos configurados.", inline=False)
     embed.add_field(name="!preset criar <nome> \"ataque 10, defesa 5\"", value="Cria/atualiza um preset com as funções e limites.", inline=False)
     embed.add_field(name="!preset listar", value="Lista os presets do servidor.", inline=False)
     embed.add_field(name="!preset ver <nome>", value="Mostra as funções/limites do preset.", inline=False)
     embed.add_field(name="!preset deletar <nome>", value="Apaga um preset.", inline=False)
-    embed.add_field(name="!evento <preset> [data]", value="Abre o evento usando um preset (ex.: `!evento guerra01 30/08`). Sem preset, segue o fluxo por perguntas.", inline=False)
+    embed.add_field(name="!setcanal", value="Define este canal como autorizado para comandos do bot.", inline=False)
+    embed.add_field(name="!evento <preset> [data]", value="Abre o evento usando um preset (ou por perguntas).", inline=False)
     embed.add_field(name="!relatorio", value="Mostra o relatório de participação.", inline=False)
+    embed.add_field(name="!ativar", value="Cria/valida o schema e ativa o servidor.", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name="funções")
@@ -710,18 +727,72 @@ async def remover_funcao(ctx, *, nome_funcao):
     else:
         await ctx.send(f"Função '{nome_funcao}' não encontrada.")
 
-# ========== Eventos globais ==========
+# ---------- Ativar & Canal ----------
+@bot.command(name="ativar")
+@commands.has_permissions(administrator=True)
+async def ativar_servidor_cmd(ctx):
+    """Cria o schema, ativa o servidor e define canal (se ainda não houver)."""
+    try:
+        ensure_schema()
+        registrar_servidor(ctx.guild)
+        ca_atual = get_canal_autorizado(ctx.guild.id)
+        if not ca_atual:
+            set_canal_autorizado(ctx.guild.id, ctx.channel.id)
+        await ctx.send("✅ Servidor cadastrado/ativado e schema verificado!")
+    except Exception as e:
+        await ctx.send("❌ Falha ao ativar. Veja os logs.")
+        import traceback
+        traceback.print_exception(type(e), e, e.__traceback__)
+
+@bot.command(name="setcanal")
+@commands.has_permissions(administrator=True)
+async def setcanal(ctx):
+    registrar_servidor(ctx.guild)
+    set_canal_autorizado(ctx.guild.id, ctx.channel.id)
+    await ctx.send(f"✅ Canal autorizado definido para <#{ctx.channel.id}> neste servidor.")
+
+# ===== Eventos globais =====
 _keep_alive_started = False
 
 @bot.event
 async def on_ready():
     global _keep_alive_started
     if not _keep_alive_started:
-        keep_alive_db.start()   # inicia a task AQUI (com loop já rodando)
+        keep_alive_db.start()
         _keep_alive_started = True
-    print(f"✅ Bot online como {bot.user}")
+    print(f"✅ Bot online como {bot.user} | instância={RENDER_INSTANCE_ID}")
 
-# ========== Embed ==========
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    try:
+        ensure_schema()
+        registrar_servidor(guild)
+        canal = guild.system_channel or next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+        if canal:
+            await canal.send("👋 Olá! Já ativei este servidor. Use `!setcanal` no canal desejado e `!ajuda` para ver os comandos.")
+    except Exception:
+        pass
+
+@bot.event
+async def on_command_error(ctx, error):
+    from discord.ext.commands import CommandNotFound, MissingRequiredArgument, BadArgument, CheckFailure
+    if isinstance(error, CommandNotFound):
+        await ctx.send("❓ Comando não encontrado. Tente `!ajuda`.")
+    elif isinstance(error, MissingRequiredArgument):
+        await ctx.send("⚠️ Faltando argumento. Veja `!ajuda`.")
+    elif isinstance(error, BadArgument):
+        await ctx.send("⚠️ Argumento inválido. Veja `!ajuda`.")
+    elif isinstance(error, CheckFailure):
+        await ctx.send("🚫 Você não tem permissão para esse comando.")
+    else:
+        await ctx.send("⚠️ Ocorreu um erro. Verifique os logs.")
+        try:
+            import traceback
+            traceback.print_exception(type(error), error, error.__traceback__)
+        except Exception:
+            pass
+
+# ===== Embed =====
 def gerar_texto_evento_embed() -> discord.Embed:
     embed = discord.Embed(
         title=f"📣 Guerra no dia {dia_evento}",
@@ -743,17 +814,16 @@ def gerar_texto_evento_embed() -> discord.Embed:
         embed.add_field(name="🚫 Sem permissão", value="\n".join(f"• {n}" for n in sem_permissao_geral), inline=False)
     return embed
 
-# ========== Launcher: bot + HTTP (Render Web Service precisa abrir porta) ==========
+# ===== HTTP server (Render Web Service precisa abrir porta) =====
 def _build_app():
     if web is None:
         return None
     app = web.Application()
     async def health(_):
         return web.Response(text="ok")
-    app.router.add_get("/healthz", health)
-    # opcional: raiz responde 200 também
     async def root(_):
         return web.Response(text="Bot up")
+    app.router.add_get("/healthz", health)
     app.router.add_get("/", root)
     return app
 
@@ -767,7 +837,6 @@ async def _start_http_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"[keepalive] HTTP ok em 0.0.0.0:{port}")
-    # mantém a task viva
     while True:
         await asyncio.sleep(3600)
 
@@ -777,10 +846,24 @@ async def _start_bot():
         raise RuntimeError("DISCORD_TOKEN não definido")
     await bot.start(token)
 
+async def _run_bot_singleton():
+    printed_wait = False
+    while True:
+        if _try_acquire_singleton_lock():
+            print(f"[singleton] lock adquirido pela instância {RENDER_INSTANCE_ID}. Iniciando bot…")
+            await _start_bot()
+            break
+        else:
+            if not printed_wait:
+                print(f"[singleton] outra instância ativa. {RENDER_INSTANCE_ID} em standby…")
+                printed_wait = True
+            await asyncio.sleep(10)
+
 async def main():
+    print(f"[boot] iniciando serviço na instância {RENDER_INSTANCE_ID}")
     await asyncio.gather(
         _start_http_server(),
-        _start_bot(),
+        _run_bot_singleton(),
     )
 
 if __name__ == "__main__":
