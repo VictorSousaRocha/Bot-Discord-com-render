@@ -1,10 +1,16 @@
-# bot.py
+# teste2.py (antes estava como "bot.py" no cabeçalho do seu texto)
 import os
 import discord
 from discord.ext import commands
 import asyncio
 from db import conectar
 from dotenv import load_dotenv
+
+# --- ADIÇÃO: servidor HTTP p/ healthcheck do Render ---
+try:
+    from aiohttp import web
+except ImportError:
+    web = None  # em produção, inclua aiohttp no requirements.txt
 
 load_dotenv()
 
@@ -53,7 +59,8 @@ def servidor_ativo(guild_id: int) -> bool:
     res = cursor.fetchone()
     cursor.close()
     conn.close()
-    return res and res[0] == 1
+    # Se 'ativo' for BOOL no Postgres, aceita True; se for inteiro (1/0), aceita 1.
+    return bool(res and (res[0] is True or res[0] == 1))
 
 def parse_funcoes_limites(texto: str):
     resultado = {}
@@ -67,8 +74,13 @@ def parse_funcoes_limites(texto: str):
 def registrar_servidor(guild: discord.Guild):
     conn = conectar()
     cursor = conn.cursor()
+    # Postgres: ON CONFLICT (id) DO NOTHING requer UNIQUE/PK em servidores.id
     cursor.execute(
-        "INSERT IGNORE INTO servidores (id, nome, ativo) VALUES (%s, %s, 1)",
+        """
+        INSERT INTO servidores (id, nome, ativo)
+        VALUES (%s, %s, 1)
+        ON CONFLICT (id) DO NOTHING
+        """,
         (guild.id, guild.name),
     )
     conn.commit()
@@ -101,12 +113,17 @@ def buscar_funcoes_do_servidor(servidor_id: int):
 def criar_guerra(servidor_id: int, data: str, mensagem_id: int, canal_id: int) -> int:
     conn = conectar()
     cursor = conn.cursor()
+    # Postgres: use RETURNING para obter id
     cursor.execute(
-        "INSERT INTO guerras (servidor_id, data, mensagem_id, canal_id) VALUES (%s, %s, %s, %s)",
+        """
+        INSERT INTO guerras (servidor_id, data, mensagem_id, canal_id)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id
+        """,
         (servidor_id, data, mensagem_id, canal_id),
     )
+    gid = cursor.fetchone()[0]
     conn.commit()
-    gid = cursor.lastrowid
     cursor.close()
     conn.close()
     return gid
@@ -126,8 +143,14 @@ def atualizar_participacao(guerra_id: int, user_id: int, username: str, emoji: s
 def salvar_cargo_funcao(servidor_id: int, nome_funcao: str, nome_cargo: str):
     conn = conectar()
     cursor = conn.cursor()
+    # Postgres não tem REPLACE. Use UPSERT:
     cursor.execute(
-        "REPLACE INTO funcoes_cargos (servidor_id, nome_funcao, nome_cargo) VALUES (%s, %s, %s)",
+        """
+        INSERT INTO funcoes_cargos (servidor_id, nome_funcao, nome_cargo)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (servidor_id, nome_funcao)
+        DO UPDATE SET nome_cargo = EXCLUDED.nome_cargo
+        """,
         (servidor_id, nome_funcao, nome_cargo),
     )
     conn.commit()
@@ -145,19 +168,23 @@ def buscar_cargo_funcao(servidor_id: int):
 
 # ========== Banco (NOVO) – Presets ==========
 def upsert_preset(servidor_id: int, nome: str, criado_por: int) -> int:
+    """
+    UPSERT real em Postgres, assumindo UNIQUE (servidor_id, nome) em presets.
+    Ativa (ativo=1) se já existir; cria se não existir.
+    """
     conn = conectar()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM presets WHERE servidor_id = %s AND nome = %s", (servidor_id, nome))
-    row = cursor.fetchone()
-    if row:
-        preset_id = row[0]
-        cursor.execute("UPDATE presets SET ativo=1 WHERE id=%s", (preset_id,))
-    else:
-        cursor.execute(
-            "INSERT INTO presets (servidor_id, nome, criado_por, ativo) VALUES (%s, %s, %s, 1)",
-            (servidor_id, nome, criado_por),
-        )
-        preset_id = cursor.lastrowid
+    cursor.execute(
+        """
+        INSERT INTO presets (servidor_id, nome, criado_por, ativo)
+        VALUES (%s, %s, %s, 1)
+        ON CONFLICT (servidor_id, nome)
+        DO UPDATE SET ativo = 1
+        RETURNING id
+        """,
+        (servidor_id, nome, criado_por),
+    )
+    preset_id = cursor.fetchone()[0]
     conn.commit()
     cursor.close()
     conn.close()
@@ -179,7 +206,7 @@ def set_preset_funcoes(preset_id: int, mapa: dict):
 def get_preset_funcoes(servidor_id: int, nome: str):
     conn = conectar()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM presets WHERE servidor_id = %s AND nome = %s AND ativo=1", (servidor_id, nome))
+    cursor.execute("SELECT id FROM presets WHERE servidor_id = %s AND nome = %s AND ativo = 1", (servidor_id, nome))
     row = cursor.fetchone()
     if not row:
         cursor.close()
@@ -301,17 +328,21 @@ async def relatorio(ctx):
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM guerras WHERE servidor_id = %s", (ctx.guild.id,))
     total_guerras = cursor.fetchone()[0]
+    # Ajustes para Postgres:
+    # - COUNT(*) FILTER (WHERE ...)
+    # - string_agg(DISTINCT ..., ',')
     cursor.execute(
         """
-        SELECT username,
-               COUNT(*) AS total_participacoes,
-               SUM(status = 'espera') AS em_espera,
-               GROUP_CONCAT(DISTINCT CASE WHEN status = 'confirmado' THEN emoji END) AS funcoes_confirmadas,
-               GROUP_CONCAT(DISTINCT CASE WHEN status = 'espera' THEN emoji END) AS funcoes_espera
+        SELECT
+            p.username,
+            COUNT(*) AS total_participacoes,
+            COUNT(*) FILTER (WHERE p.status = 'espera') AS em_espera,
+            string_agg(DISTINCT CASE WHEN p.status = 'confirmado' THEN p.emoji END, ',') AS funcoes_confirmadas,
+            string_agg(DISTINCT CASE WHEN p.status = 'espera' THEN p.emoji END, ',') AS funcoes_espera
         FROM participantes p
         JOIN guerras g ON p.guerra_id = g.id
         WHERE g.servidor_id = %s
-        GROUP BY username
+        GROUP BY p.username
         """,
         (ctx.guild.id,),
     )
@@ -554,5 +585,45 @@ def gerar_texto_evento_embed() -> discord.Embed:
         embed.add_field(name="🚫 Sem permissão", value="\n".join(f"• {n}" for n in sem_permissao_geral), inline=False)
     return embed
 
-# Token (NÃO inicie a task aqui!)
-bot.run(os.getenv("DISCORD_TOKEN"))
+# ========== Launcher: bot + HTTP (Render Web Service precisa abrir porta) ==========
+def _build_app():
+    if web is None:
+        return None
+    app = web.Application()
+    async def health(_):
+        return web.Response(text="ok")
+    app.router.add_get("/healthz", health)
+    # opcional: raiz responde 200 também
+    async def root(_):
+        return web.Response(text="Bot up")
+    app.router.add_get("/", root)
+    return app
+
+async def _start_http_server():
+    app = _build_app()
+    if app is None:
+        return
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[keepalive] HTTP ok em 0.0.0.0:{port}")
+    # mantém a task viva
+    while True:
+        await asyncio.sleep(3600)
+
+async def _start_bot():
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN não definido")
+    await bot.start(token)
+
+async def main():
+    await asyncio.gather(
+        _start_http_server(),
+        _start_bot(),
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())

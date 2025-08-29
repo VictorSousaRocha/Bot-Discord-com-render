@@ -1,29 +1,43 @@
+# db.py
 import os
-import psycopg
+import psycopg  # psycopg v3 (adicione 'psycopg[binary]' no requirements)
 
 def conectar():
     """
-    Usa DATABASE_URL (postgres://... sslmode=require).
-    Se não existir, tenta variáveis separadas: PGHOST/PGDATABASE/PGUSER/PGPASSWORD/PGPORT.
-    Força SSL por padrão (recomendado em Render/Neon).
+    Conecta no Postgres priorizando:
+      1) DATABASE_URL (ex.: postgres://user:pass@host:5432/db?sslmode=require)
+      2) Variáveis separadas: PGHOST, PGUSER, PGPASSWORD, PGDATABASE, PGPORT (opcional), PGSSLMODE (opcional)
     """
-    url = os.getenv("DATABASE_URL")
-    if url:
-        # psycopg3 aceita string de conexão; sslmode=require já vem na URL do Render
-        return psycopg.connect(url)
+    # 1) Se houver DATABASE_URL, usa direto
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        # 2) Monta a partir das PG* vars (nomes exatamente como no seu Render)
+        host = os.getenv("PGHOST")
+        user = os.getenv("PGUSER")
+        password = os.getenv("PGPASSWORD")
+        dbname = os.getenv("PGDATABASE")
+        port = os.getenv("PGPORT", "5432")           # default Postgres
+        sslmode = os.getenv("PGSSLMODE", "require")  # no Render geralmente 'require'
 
-    host = os.getenv("PGHOST", "localhost")
-    db   = os.getenv("PGDATABASE", "postgres")
-    user = os.getenv("PGUSER", "postgres")
-    pwd  = os.getenv("PGPASSWORD", "")
-    port = int(os.getenv("PGPORT", "5432"))
+        # validação básica pra evitar conexão vazia
+        missing = [k for k, v in {
+            "PGHOST": host,
+            "PGUSER": user,
+            "PGPASSWORD": password,
+            "PGDATABASE": dbname
+        }.items() if not v]
+        if missing:
+            raise RuntimeError(
+                "Variáveis de conexão ausentes: " + ", ".join(missing) +
+                ". Defina DATABASE_URL OU as variáveis PG*."
+            )
 
-    return psycopg.connect(
-        host=host,
-        dbname=db,
-        user=user,
-        password=pwd,
-        port=port,
-        sslmode="require",
-    )
+        dsn = f"postgres://{user}:{password}@{host}:{port}/{dbname}?sslmode={sslmode}"
 
+    # autocommit False por padrão; chame conn.commit() em INSERT/UPDATE/DELETE
+    return psycopg.connect(dsn, autocommit=False)
+
+
+# (Opcional) teste rápido local: python db.py
+if __name__ == "__main__":
+    try:
